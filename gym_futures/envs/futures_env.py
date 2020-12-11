@@ -1,7 +1,9 @@
 import gym
-import pathlib
+import json
+from pathlib import Path
 from gym import error, spaces, utils
 from gym.utils import seeding
+from uuid import uuid4
 
 
 class FuturesEnv(gym.Env):
@@ -77,10 +79,12 @@ class FuturesEnv(gym.Env):
     the cost of executing 1 buy or sell order. Include the cost
     per 1 side of the trade, the calculation for net profit
     accounts for 2 orders
-  render_to_file: Union[str, pathlib.Path]
-    if specified, a str or Path representing the directory to 
-    render the results of the epoch. see `render` for details on what 
-    is generated for each epoch. Default: None.
+  add_current_position_to_state: bool
+    adds the current position to the next state. Default: False
+  log_dir: str
+    a str or Path representing the directory to 
+    render the results of the epoch. see `render` will generate
+    output metrics to tensorflow
   """
 
   metadata = {'render.modes': ['human']}
@@ -89,7 +93,8 @@ class FuturesEnv(gym.Env):
                tick_size: float, fill_probability: float = 1., long_values: List[float] = None, 
                long_probabilities: List[float] = None, short_values: List[float] = None, 
                short_probabilities: List[float] = None, execution_cost_per_order=0.,
-               add_current_trade_information_to_state: bool = False, render_to_file: Union[str, pathlib.Path] = None):
+               add_current_position_to_state: bool = False, 
+               log_dir: str = f"logs/futures_env/{datetime.datetime.strftime(datetime.datetime.now(), '%Y%m%d_%H%M%S')}"):
  
     self.states = states
     self.limit = len(self.states)
@@ -102,23 +107,103 @@ class FuturesEnv(gym.Env):
     self.can_generate_random_fills = all([self.long_values, self.long_probabilities, self.short_values, self.short_probabilities])
     self.fill_probability = fill_probability
     self.execution_cost_per_order = execution_cost_per_order
-    self.add_current_trade_information_to_state = add_current_trade_information_to_state
-    self.render_to_file = render_to_file
+    self.add_current_position_to_state = add_current_position_to_state
+    self.log_dir = log_dir
     self.done = False
     self.current_index = 0
+
     self.current_price = None
-    self.position = 0
-    self.ts_last_trade = None
-    self.price_last_trade = None
-    self.profit_last_trade = 0.
+    # attributes to maintain the current position
+    self.current_position = 0
+    self.last_position = 0
+    
+    self.entry_time = None
+    self.entry_id = None
+    self.entry_price = None
+
+    self.exit_time = None
+    self.exit_id = None
+    self.exit_price = None
+
+    # episode attributes
     self.total_reward = 0
     self.total_net_profit = 0
-    self.buys = []
-    self.sells = []
-    self.longs = []
-    self.shorts = []
-    self.trade_durations = []
+    self.orders = []
+    self.trades = []
+    self.episode = 0
     self.feature_data = []
+    
+    Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+
+  def buy(self, state: TimeSeriesState):
+    """Creates a buy order"""
+    if self.current_position == 1:
+      # does not perform a buy order
+      pass
+    elif self.current_position == -1:
+      self.last_position = self.current_position
+      self.current_position = 0
+
+      self.exit_price = self.generate_random_fill_differential(state.price, 1)
+      self.exit_time = state.ts
+      self.exit_id = str(uuid4())
+      self.orders.append([self.exit_id, str(state.ts), self.exit_price, 1, state])
+
+    elif self.current_position == 0:
+      self.last_position = self.current_position
+      self.current_position = 1
+      self.entry_price = self.generate_random_fill_differential(state.price, 1)
+      self.entry_time = state.ts
+      self.entry_id = str(uuid4())
+      self.orders.append([self.entry_id, str(state.ts), self.entry_price, 1, state])
+
+  def sell(self, state: TimeSeriesState):
+    """generates a sell order"""
+    if self.current_position == -1:
+      # does not perform a sell
+      pass
+
+    elif self.current_position == 1:
+      self.last_position = self.current_position
+      self.current_position = 0
+      self.exit_price = self.generate_random_fill_differential(state.price, -1)
+      self.exit_time = state.ts
+      self.exit_id = str(uuid4())
+      self.orders.append([self.exit_id, str(state.ts), self.exit_price, -1, state])
+
+    elif self.current_position == 0:
+      self.last_position = self.current_position
+      self.current_position = -1
+      self.entry_price = self.generate_random_fill_differential(state.price, -1)
+      self.entry_time = state.ts
+      self.entry_id = str(uuid4())
+      self.orders.append([self.entry_id, str(state.ts), self.entry_price,-1, state])
+
+  def get_reward(self, state: TimeSeriesState) -> float:
+    """
+    This environments default reward function. Override this class and method for a custom reward function
+    """
+    net_profit = 0
+    if any([all([self.current_position == 0, self.last_position == 0]),
+        all([self.current_position == 1, self.last_position == 0]),
+        all([self.current_position == -1, self.last_position == 0])]):
+      # no reward for no action taken or holding a position only receive rewards for closing a trade
+      return net_profit
+
+    else:
+      if all([self.current_position == 0, self.last_position == 1]):
+        # closed a long
+        dif =  round((self.exit_price - self.entry_price),2)
+      elif all([self.current_position == 0, self.last_position == -1]):
+        # closed a short
+        dif = - round((self.exit_price - self.entry_price),2)
+      n_ticks = math.ceil(dif / self.tick_size)
+      gross_profit = n_ticks * self.value_per_tick
+      net_profit = gross_profit - (2*self.execution_cost_per_order)
+    
+    self.total_reward += net_profit
+    return net_profit
+        
    
   def step(self, action):
     """
@@ -138,215 +223,191 @@ class FuturesEnv(gym.Env):
 
     if action == 0:
       # a buy action signal is received
-      if self.position == 1:
-        # a buy action is recommended by the agent whilst currently in a long -> a hold
+      if self.current_position == 1:
+        # a buy is recommended whilst in a long - no action
+        reward = self.get_reward(s) 
         info = {"message": "hold - a buy was recommended while in an open long position"}
-        reward = self.get_reward() 
         return (_s, reward, self.done, info)
-      if self.position == 0:
+      if self.current_position == 0:
         # a buy is recommended by the agent whilst no position - creating a long
         # this fills with pr(fill) == self.fill_probability
         if np.random.choice(a=[0,1], 
                             size=1, 
                             p=[1-self.fill_probability, self.fill_probability])[0] == 1:
-          self.time_last_trade = s.ts
-          self.position = 1
-          trade_price = self.generate_random_fill_differential(current_state_price, 1)
-          self.price_last_trade = trade_price
-          reward = self.get_reward()
+          
+          self.buy(s)
+
+          reward = self.get_reward(s)
+
           info = {
-              "message": "long trade entered at attempt:{}, fill:{}, {}".format(current_state_price, trade_price, self.time_last_trade)
+              "message": f"timestamp: {str(self.entry_time)}, long trade attempted at: {current_state_price}, filled at: {self.entry_price}"
           }
-          self.buys.append([str(s.ts), trade_price])
           return (_s, reward, self.done, info)
         else:
           info= {
               "message": "a long was recommended, but was not filled given the current fill probability"
           }
-          return(_s, 0, self.done, info)
+          return(_s, reward, self.done, info)
 
 
-      if self.position == -1:
-        # a buy is recommended by the agent whilst in a sell. This closes a short
-          
-        _time_last_trade = self.time_last_trade
-        time_current_trade = s.ts
+      if self.current_position == -1:
+        # a buy is recommended by the agent whilst in a sell. 
+        # This closes a short
 
-        total_elapsed_seconds = (time_current_trade - _time_last_trade).total_seconds()
+        self.buy(s)  
 
-        # dif will be + if the current_state_price is BELOW the previously recorded
-        # price. This will result in a positive profit movement corresponding with the
-        # trade direction
-        plt = self.price_last_trade
-        current_state_price = self.generate_random_fill_differential(current_state_price, 1)
-        dif = round((plt - curent_state_price),2)
-        n_ticks = math.ceil(dif / self.minimum_price_movement)
-        gross_profit = n_ticks * self.contract_multiplier
-        net_profit = gross_profit - (2*self.commission_per_trade)
-        
-        if net_profit < 0:
-          # if the net_profit is negative, apply the full negative reward to `dissuade`
-          reward = net_profit 
-        else:
-          # apply the time discounted net profit
-          # this is to encourage short term high profit trades vs long term holding
-          try:
-            reward = net_profit * ((n_ticks*5)*((1/2)**total_elapsed_seconds))
-          except OverflowError:
-            reward = net_profit
-          
+        reward = self.get_reward(s)
+
+        net_profit = reward
+
+        info = {
+            "message": f"timestamp: {str(s.ts)}, short closed from {self.entry_price} to {self.exit_price} - total profit: {net_profit}"
+        }
 
         self._close_position(reward, net_profit)
 
-        info = {
-            "message": "short closed from  {} to {} - total profit: {}, {}".format(plt, 
-                                                                                   current_state_price,
-                                                                                   net_profit, 
-                                                                                   s.ts)
-        }
-        self.buys.append([str(s.ts), s.price])
-        self.shorts.append([str(s.ts), str(_time_last_trade), plt, current_state_price, net_profit, reward, total_elapsed_seconds])
-        self.trade_durations.append(total_elapsed_seconds)
         return (_s, reward, self.done, info)
 
     elif action == 1:
-      reward = self.reward()
+      # no action recommended
+      reward = self.get_reward(s)
       info = {"message": "no action performed"} 
       return (_s, reward, self.done, info)
     
     
     elif action == 2:
       # a sell signal is received
-      if self.position == 1:
-      # a sell is recommended whilst in a long - this is a long close
-        _time_last_trade = self.time_last_trade
-        time_current_trade = s.ts
+      if self.current_position == 1:
+        # a sell is recommended by the agent whilst in a buy. 
+        # This closes a long
 
-        total_elapsed_seconds = int((time_current_trade - _time_last_trade).total_seconds())
+        self.sell(s)  
 
-        # dif will be + if the current_state_price is ABOVE the previously recorded
-        # price. This will result in a positive profit movement corresponding with the
-        # trade direction
-        plt = float(self.price_last_trade)
-        current_state_price = self.generate_random_fill_differential(float(current_state_price), -1)
-        dif = round((float(current_state_price) - plt), 2)
-        n_ticks = math.ceil(dif / self.minimum_price_movement)
-        gross_profit = n_ticks * self.contract_multiplier
+        reward = self.get_reward(s)
 
-        net_profit = gross_profit - (2*self.commission_per_trade)
-        if net_profit < 0:
-          # if the net_profit is negative, apply the full negative reward to `dissuade`
-          reward = net_profit
-        else:
-          # apply the time discounted net profit
-          # this is to encourage short term high profit trades vs long term holding
-          try:
-            reward = net_profit * ((n_ticks*5)*((1/2)**total_elapsed_seconds))
-          except OverflowError:
-            reward = net_profit
-        
+        net_profit = reward
 
-        self.position = 0
-        self.price_last_trade = None
-        self.time_last_trade = None
-        info = {"message": "long closed from {} to {} - total profit: {}, {}".format(plt, current_state_price, net_profit, s.ts)}
-        self.total_reward += reward
-        self.total_net_profit += net_profit
-        self.sells.append([s.ts_string, s.price])
-        self.longs.append([s.ts_string, str(_time_last_trade), plt, current_state_price, net_profit, reward, total_elapsed_seconds])
-        self.trade_durations.append(total_elapsed_seconds)
+        info = {
+            "message": f"timestamp: {str(s.ts)}, long closed from {self.entry_price} to {self.exit_price} - total profit: {net_profit}"
+        }
+
+        self._close_position(reward, net_profit)
+
         return (_s, reward, self.done, info)
 
-      if self.position == 0:
-        if np.random.choice(a=[0,1],size=1, p=[1-self.fill_probability, self.fill_probability])[0] == 1:
-          # a sell is recommended by the agent whilst no position - creating a short
-          self.time_last_trade = s.ts
-          trade_price = self.generate_random_fill_differential(float(current_state_price), -1)
-          self.price_last_trade = trade_price
-          self.position = -1
-          reward = 0
-          info = "short trade entered at attempt:{}, fill:{}, {}".format(current_state_price, trade_price, self.time_last_trade)
-          self.sells.append([s.ts_string, trade_price])
-          return (_s, reward, self.done, info)
-        else:
-          info= "a short was recommended, but was not filled given the current fill probability"
-          return(_s,0,self.done, info)
-
-      if self.position == -1:
-        
-        reward = 0
+      if self.current_position == 0:
+        # a sell is recommended by the agent whilst no position - creating a short
+        # this fills with pr(fill) == self.fill_probability
+        if np.random.choice(a=[0,1], 
+                            size=1, 
+                            p=[1-self.fill_probability, self.fill_probability])[0] == 1:
           
-        info = "no trade performed, no reward to calculate"
+          self.sell(s)
+
+          reward = self.get_reward(s)
+
+          info = {
+              "message": f"timestamp: {str(self.entry_time)}, short trade attempted at: {current_state_price}, filled at: {self.entry_price}"
+          }
+          return (_s, reward, self.done, info)       
+        
+        else:
+          info = {
+              "message": "a long was recommended, but was not filled given the current fill probability"
+          }
+          return(_s, 0, self.done, info)
+
+      if self.current_position == -1:
+        # a sell is recommended whilst in a short - no action
+        reward = self.get_reward(s) 
+        info = info = {"message": "hold - a sell was recommended while in an open short position"}
         return (_s, reward, self.done, info)
 
-  def reset(self):
+  def reset(self, e):
     self.done = False
     self.current_index = 0
-    self.position = 0
-    self.time_last_trade = None
-    self.price_last_trade = None
+
+    self.current_price = None
+    # attributes to maintain the current position
+    self.current_position = 0
+    self.last_position = 0
+    
+    self.entry_time = None
+    self.entry_id = None
+    self.entry_price = None
+
+    self.exit_time = None
+    self.exit_id = None
+    self.exit_price = None
+
+    # episode attributes
     self.total_reward = 0
     self.total_net_profit = 0
-    self.buys = []
-    self.sells = []
-    self.longs = []
-    self.shorts = []
-    self.trade_durations = []
-    self.current_price = self.states[self.current_index].price
-    # return the first state of the episode
+    self.orders = []
+    self.trades = []
+    self.feature_data = []
+    
+    self.episode = e
     return self.states[0]
   
   def render(self):
-    pass
-  
-  def close(self):
-    pass
-
-  def get_reward(self):
-    pass
-
-
-  def _close_position(self, reward, net_profit):
-    self.position = 0
-    self.ts_last_trade = None
-    self.price_last_trade = None
-    self.total_reward += reward
-    self.total_net_profit += net_profit
-
-  def get_episode_dataframes(self):
     """
-    Returns dataframes of the trades that occurred in the episode
+    As the result of each episode, the render method will:
+      1. generate distributions of the duration of each trade and the profit/loss for each trade
+      2. generate pnl metrics (expectancy, win rate, etc)
+
+    """
+    self._generate_episode_graphs()
+    metrics = self.generate_episode_metrics()
+
+    return self.total_reward, metrics
+
+
+
+  def _close_position(self, reward: float, net_profit:float):
+    """resets the internal state for the position"""
+
+    duration = (self.exit_time - self.entry_time).total_seconds()
+    trade_id = str(uuid4())
+    if all([self.current_position == 0, self.last_position == -1]):
+      # closed a short
+      self.trades.append([trade_id, "short", self.entry_id, self.exit_id, net_profit, reward, duration])
+    elif all([self.current_position == 0, self.last_position == 1]):
+      # closed a short
+      self.trades.append([trade_id, "long", self.entry_id, self.exit_id, net_profit, reward, duration])
+
+    self.current_position = 0
+    self.last_position = 0
+    
+    self.entry_time = None
+    self.entry_id = None
+    self.entry_price = None
+
+    self.exit_time = None
+    self.exit_id = None
+    self.exit_price = None
+
+  def get_episode_data(self, return_states:bool = False) -> Tuple[pandas.DataFrame, pandas.DataFrame]:
+    """
+    Returns metadata of the trades that occurred in the episode
 
     Returns
     -------
     dataframes: Tuple[pandas.DataFrame]
-      (buy_orders, sell_orders, longs, shorts, all_trades)
-      buy_orders: all of the buys that occurred in the episode
-      sell_orders: all of the sells that occurred in the episode
-      longs: all 'long' trades.  a long is a trade that begins with a buy, ends with a sell
-        Intended to profit from increases in price
-      shorts: all 'short' trades, a short is a trade that enters with a sell, ends with a buy. 
-        Intended to profit from decreases in price
+      (orders, trades)
+      orders: all of the orders that occurred in the episode
+      trades: all of the trades that occurred in the episode
     """
-    bs_cols = ['time',  'close']
-    ls_cols = ['time', 'entry_time', 'entry_price', 'exit_price', 'profit', 'reward', 'duration']
-    buy_df = pd.DataFrame(self.buys)
-    buy_df.columns = bs_cols
-    sell_df = pd.DataFrame(self.sells)
-    sell_df.columns = bs_cols
+    order_cols = ['order_id', 'timestamp', 'price', 'type']
+    # does not include state in the order_df
+    order_df = pd.DataFrame(np.array(self.orders)[:, :4])
+    order_df.columns = order_cols
 
-    long_df = pd.DataFrame(self.longs)
-    long_df.columns = ls_cols
-    long_df['trade_type'] = 'LONG'
+    trade_cols = ['trade_id', 'trade_type', 'entry_order_id', 'exit_order_id', 'profit', 'reward', 'duration']
+    trade_df = pd.DataFrame(self.trades)
+    trade_df.columns  = trade_cols
 
-    short_df = pd.DataFrame(self.shorts)
-    short_df.columns = ls_cols
-    short_df['trade_type'] = 'SHORT'
-
-    all_trades = pd.concat([long_df, short_df])
-
-    all_trades.sort_values(by='time', inplace=True)
-    return buy_df, sell_df, long_df, short_df, all_trades
+    return order_df, trade_df
 
 
   def generate_random_fill_differential(self, intent_price: float, trade_type:int) -> float:
@@ -405,17 +466,33 @@ class FuturesEnv(gym.Env):
    
 
   
-  def generate_episode_metrics(self, as_file=None):
+  def generate_episode_metrics(self, as_file: bool=True) -> dict:
     """
     Generates typical session metrics such as win rate, loss rate, expectancy, etc.
+
+    Parameters
+    ----------
+    as_file: bool
+      saves metrics to a json file. Defaults to true
+
+
+    Returns
+    --------
+    dict
+      a dictionary containing all the metrics.
+      The runnning pnl is returned as a list (for visualizations)
     """
-    buy_df, sell_df, long_df, short_df, all_trades = self.get_episode_dataframes()
+    orders, trades = self.get_episode_data()
+
+    long_df = trades[trades["trade_type"] == "long"]
+    short_df = trades[trades["trade_type"] == "short"]
+    all_trades = trades
     
-    running_pl = []
-    pl_val = 0
-    for i, row in  all_trades.iterrows():
-       pl_val += row['profit']
-       running_pl.append(pl_val)
+    running_pnl = []
+    pnl_val = 0
+    for i, row in trades.iterrows():
+       pnl_val += row['profit']
+       running_pnl.append(pnl_val)
   
     total_longs = len(long_df)
     l_tnp =  sum(long_df['profit']) if total_longs > 0 else 0
@@ -457,7 +534,7 @@ class FuturesEnv(gym.Env):
     profit_factor = abs(win_pl) / abs(loss_pl)
     win_percentage = (len(wins) / total_trades) * 100
 
-    intraday_low = np.min(running_pl)
+    intraday_low = np.min(running_pnl)
     expectancy = (win_percentage * win_avg) - ((1-win_percentage) * loss_avg)
 
     
@@ -490,31 +567,37 @@ class FuturesEnv(gym.Env):
       'l_max_loss' : l_max_loss,
       'l_win_avg' : l_win_avg,
       'l_loss_avg' : l_loss_avg,
-      'pnl_monotonicity': monotonicity(running_pl),
-      'running_pl': running_pl
+      'pnl_monotonicity': monotonicity(running_pnl),
+      'running_pl': running_pnl
     }
+    Path(f"{self.log_dir}/metrics").mkdir(parents=True, exist_ok=True)
     if as_file:
-      with open(as_file, "w+") as _file:
-        _file.write(json.dumps(vars_))
+      with open(f"{self.log_dir}/metrics/metrics_episode_{str(self.episode)}.json", "w+") as _file:
+        _file.write(json.dumps(vars_, indent=4))
     return vars_
 
 
-  def generate_episode_graphs(self,show=False):
+  def _generate_episode_graphs(self):
     import matplotlib.pyplot as plt
-    buy_signal, sell_signal, long_df, short_df, _=  self.get_episode_dataframes()
-
+    orders, trades =  self.get_episode_data()
+    
+    short_df = trades[trades["trade_type"] == "short"]
+    long_df = trades[trades["trade_type"] == "long"]
+    durations = trades["duration"]
+    
     #trade durations
-    fig1 = plt.hist(self.trade_durations, bins=20)
-    plt.savefig("img/trade_durations_{}.png".format(self.episode))
+    fig1 = plt.hist(durations, bins=20)
+    Path(f"{self.log_dir}/img").mkdir(parents=True, exist_ok=True)
+    plt.savefig(f"{self.log_dir}/img/duration_distribution_episode_{self.episode}.png")
     plt.clf()
-    plt.hist(long_df['profit'], bins=20, alpha=0.5, label='long')
-    plt.hist(short_df['profit'], bins=20, alpha=0.5, label='short')
-    plt.savefig("img/long_short_profit_{}.png".format(self.episode))
+    plt.hist(long_df["profit"], bins=20, alpha=0.5, label="long")
+    plt.hist(short_df["profit"], bins=20, alpha=0.5, label="short")
+    plt.savefig(f"{self.log_dir}/img/profit_loss_distribution_episode_{self.episode}.png")
     plt.clf()
 
 
   def _get_next_state(self):
-    current_state = self.state[self.current_index]
+    current_state = self.states[self.current_index]
     self.current_index += 1
     if self.current_index  <= self.limit -1 :
       next_state = self.states[self.current_index]
@@ -522,8 +605,8 @@ class FuturesEnv(gym.Env):
       if current_state.ts > next_state.ts:
         raise Exception("the time stamp of the current state is greater than the next state")
       # adds current position to the next state
-      if self.add_current_trade_information_to_state:
-        next_state.set_current_position(self.position, self.time_last_trade, self.price_last_trade)
+      if self.add_current_position_to_state:
+        next_state.set_current_position(self.current_position, self.entry_time, self.entry_time)
       return (next_state, current_state)
     else:
       self.done = True
