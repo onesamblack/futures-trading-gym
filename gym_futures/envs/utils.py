@@ -1,7 +1,8 @@
 import datetime
-from typing import List, Tuple, Sequence, Union 
+from typing import List, Tuple, Sequence, Union, Dict
 import math
-
+import pandas
+import numpy
 
 def round_to_nearest_increment(x :float, tick_size : float = 0.25) -> float:
   """
@@ -19,7 +20,32 @@ def round_to_nearest_increment(x :float, tick_size : float = 0.25) -> float:
     return tick_size
   else:
     return val
-               
+
+def monotonicity(series: Union[pandas.Series, pandas.DataFrame, numpy.ndarray]) -> float:
+  """
+  Measures the monotonicity of a series on a -1 to 1 scale, with 1 being perfectly monotonic and
+  -1 being anti-monotonic
+  
+  Parameters
+  -----------
+  series : Sequence
+    a 
+  
+  """
+
+  dirs = []
+  for i, val in enumerate(series):
+    if i == 0:   
+      pass
+    else:
+      dif = val - series[i-1]
+      if dif > 0:
+        dirs.append(1)
+      elif dif == 0:
+        dirs.append(0)
+      else:
+        dirs.append(-1)
+  return np.mean(dirs)
 
 
 class TimeSeriesState:
@@ -42,8 +68,6 @@ class TimeSeriesState:
   data : Sequence
     a sequence of records, such as a pandas.DataFrame, a np.ndarray, or a list of lists
     e.g. [[2020-01-01 01:01:59, 3290.25, 3290.50, .08, ... ]]
-  window_size: int
-    the size of the window. Defaults to 1
   close_price_identifier: Union[int, str]
     a int, string identifier for the close price in the data
   timestamp_identifier: Union[int, str]
@@ -56,23 +80,20 @@ class TimeSeriesState:
  
 
   """
-  def __init__(self, data: Sequence, window_size: int = 1, close_price_identifier: Union[int,str] = None, 
+  def __init__(self, data: Union[pandas.DataFrame, numpy.ndarray, List], close_price_identifier: Union[int,str] = None, 
                timestamp_identifier: Union[int, str] = None, timestamp_format: str = None):
     self.data = data
-    self.window_size = window_size
-    if len(self.data) != self.window_size:
-      raise Exception("state size of {} does not match the window size: {}".format(len(self.data), self.window_size))
     if close_price_identifier:
-      self.price = float(data[-1][close_price_identifier])
+      self.price = float(data[-1:][close_price_identifier])
     else:
-      self.price = float(data[-1]["close"])
+      self.price = float(data[-1:]["close"])
     
-    self.time_format = "%Y-%m-%d %H:%M:%S" if not timestamp_format else timestamp_format
+    self.timestamp_format = "%Y-%m-%d %H:%M:%S" if not timestamp_format else timestamp_format
 
     if timestamp_identifier:
-      self.ts = self._timestamp_to_py_time(data[-1][timestamp_identifier])
+      self.ts = self._timestamp_to_py_time(data[-1:][timestamp_identifier])
     else:
-      self.ts = self._timestamp_to_py_time(data[-1]["time"])  
+      self.ts = self._timestamp_to_py_time(data[-1:]["time"])  
     self.current_position = None
     self.entry_time = None
     self.entry_price = None
@@ -80,8 +101,9 @@ class TimeSeriesState:
   def _timestamp_to_py_time(self, ts: str):
     """converts the string ts to a datetime object 
     """
-    if type(ts) != datetime.datetime:
-      return datetime.datetime.strptime(ts, self.time_format)
+    val = list(ts)[0]
+    if type(val) != datetime.datetime:
+      return datetime.datetime.strptime(val, self.timestamp_format)
     else:
       return ts
   
@@ -103,9 +125,11 @@ class TimeSeriesState:
     self.entry_time = time
     self.entry_price = price
  
+  def __str__(self):
+    return f"timestamp: {self.ts}, price: {self.price}, current_position: {self.current_position}, entry_time: {self.entry_time}, entry_price: {self.entry_price}"
  
 
-  def _to_feature_vector(self):
+  def to_feature_vector(self, *args, **kwargs):
     """Users should override this. E.g. if your agent uses PyTorch tensors
     convert the current state and the data into a tensor object, etc.
 
