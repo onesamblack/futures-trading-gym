@@ -1,8 +1,9 @@
 import datetime
 from typing import List, Tuple, Sequence, Union, Dict
 import math
-import pandas
+import pandas 
 import numpy
+from operator import itemgetter
 
 def round_to_nearest_increment(x :float, tick_size : float = 0.25) -> float:
   """
@@ -45,7 +46,7 @@ def monotonicity(series: Union[pandas.Series, pandas.DataFrame, numpy.ndarray]) 
         dirs.append(0)
       else:
         dirs.append(-1)
-  return np.mean(dirs)
+  return numpy.mean(dirs)
 
 
 class TimeSeriesState:
@@ -82,30 +83,40 @@ class TimeSeriesState:
   """
   def __init__(self, data: Union[pandas.DataFrame, numpy.ndarray, List], close_price_identifier: Union[int,str] = None, 
                timestamp_identifier: Union[int, str] = None, timestamp_format: str = None):
+
+    if type(data) == list:
+      # convert list to numpy array for convenience
+      data = numpy.array(data)
     self.data = data
     if close_price_identifier:
-      self.price = float(data[-1:][close_price_identifier])
+      if type(data)  == numpy.ndarray:
+        self.price = float(data[-1:,close_price_identifier])
+      else:
+        self.price = float(data[-1:][close_price_identifier])
     else:
       self.price = float(data[-1:]["close"])
     
     self.timestamp_format = "%Y-%m-%d %H:%M:%S" if not timestamp_format else timestamp_format
 
-    if timestamp_identifier:
-      self.ts = self._timestamp_to_py_time(data[-1:][timestamp_identifier])
+    if timestamp_identifier != None:
+      if type(data) == numpy.ndarray:
+        self.ts = self._timestamp_to_py_time(data[-1:, timestamp_identifier])
+      else:
+        self.ts = self._timestamp_to_py_time(data[-1:][timestamp_identifier])
     else:
       self.ts = self._timestamp_to_py_time(data[-1:]["time"])  
     self.current_position = None
     self.entry_time = None
     self.entry_price = None
-  
+      
   def _timestamp_to_py_time(self, ts: str):
     """converts the string ts to a datetime object 
     """
     val = list(ts)[0]
-    if type(val) != datetime.datetime:
+    if type(val) not in [datetime.datetime, pandas.Timestamp]:
       return datetime.datetime.strptime(val, self.timestamp_format)
     else:
-      return ts
+      return val
   
   def set_current_position(self, pos: int, time: datetime.datetime, price: float):
     """
@@ -136,4 +147,3 @@ class TimeSeriesState:
     This depends on how your agent operates
     """
     pass
-    
