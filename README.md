@@ -91,6 +91,7 @@ To use this environment, you will need to do the following:
 3. Run your episodes
 
 Example:
+
 ```python 
 import pandas as pd
 import numpy as np
@@ -105,10 +106,10 @@ states = []
 window_size = 5
 
 # create custom TimeSeriesState
-class  WindowedTimeSeries(TimeSeriesState):
+class WindowedTimeSeries(TimeSeriesState):
   def  __init__(self, data, window_size, timestamp_format):
-  super().__init__(data,timestamp_format=timestamp_format)
-  self.window_size = window_size
+    super().__init__(data,timestamp_format=timestamp_format)
+    self.window_size = window_size
 
   def  to_feature_vector(self, *args, **kwargs):
     """A simple tensor"""
@@ -119,8 +120,8 @@ class  WindowedTimeSeries(TimeSeriesState):
 for i in range(0,len(data)-window_size):
   window = data.iloc[i:i+window_size]
   state = WindowedTimeSeries(window, 
-                window_size=window_size, 
-                timestamp_format="%Y-%m-%d %H:%M:%S.%f")
+                             window_size=window_size,
+                             timestamp_format="%Y-%m-%d %H:%M:%S.%f")
 
   states.append(state)
 
@@ -139,9 +140,8 @@ ES = {
   
 
 env = FuturesEnv(states=states, value_per_tick=ES["value_per_tick"],
-        tick_size=ES["minimum_price_movement"],
-        execution_cost_per_order=2.37, 
-        add_current_position_to_state=True)
+                 tick_size=ES["minimum_price_movement"], execution_cost_per_order=2.37, 
+                 add_current_position_to_state=True)
 
 for e in range(0, episodes):
   s = env.reset(e)
